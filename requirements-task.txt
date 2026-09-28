@@ -1,0 +1,13 @@
+# A/B 运行环境：WSL 内共享 venv ~/venvs/base（Python 3.12.14）
+# 本文件只是版本记录。运行时不要 pip install、不要联网，解释器统一用：
+#   ~/venvs/base/bin/python -m pytest tests/ -q
+#
+# 直接依赖
+numpy==2.5.3
+pytest==9.1.1
+#
+# 标准库（无需安装）：os、typing、dataclasses
+#
+# 说明：backend/speaker_diarizer.py 里的 librosa 与 pyannote.audio 只出现在懒加载分支，
+# 本机任何 venv 都没有安装、也不允许安装；本题的验证命令不会进入这些分支，
+# 测试一律注入替身 pipeline。

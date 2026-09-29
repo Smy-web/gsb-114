@@ -12,12 +12,39 @@ class SpeakerSegment:
     end_time: float
     confidence: float
     text: str = ""
+    needs_review: bool = False
+
+
+def _is_cjk_char(ch: str) -> bool:
+    code = ord(ch)
+    return (0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0xF900 <= code <= 0xFAFF)
+
+
+def _count_words(text: str) -> int:
+    """CJK 字符逐字计数，其余连续非空白字符按空白切词计数。"""
+    count = 0
+    in_token = False
+    for ch in text:
+        if ch.isspace():
+            in_token = False
+        elif _is_cjk_char(ch):
+            count += 1
+            in_token = False
+        else:
+            if not in_token:
+                count += 1
+                in_token = True
+    return count
 
 
 class PyannoteSpeakerDiarizer:
-    def __init__(self, auth_token: str = None, use_gpu: bool = False):
+    def __init__(self, auth_token: str = None, use_gpu: bool = False,
+                 review_threshold: float = 0.6):
         self.auth_token = auth_token or os.getenv('PYANNOTE_AUTH_TOKEN', '')
         self.use_gpu = use_gpu
+        self.review_threshold = review_threshold
         self.diarization_pipeline = None
         self.embedding_model = None
         self._role_keywords = {
@@ -78,31 +105,40 @@ class PyannoteSpeakerDiarizer:
         else:
             return 'unknown', 0.5
 
-    def _update_speaker_profile(self, speaker_id: str, text: str):
+    def _update_speaker_profile(self, speaker_id: str, text: str,
+                                count_for_role: bool = True):
         if speaker_id not in self._speaker_profiles:
             self._speaker_profiles[speaker_id] = {
                 'texts': [],
-                'role_votes': {'engineer': 0, 'climatologist': 0, 'unknown': 0}
+                'role_votes': {'engineer': 0, 'climatologist': 0, 'unknown': 0},
+                'needs_review_segments': 0
             }
-        
-        self._speaker_profiles[speaker_id]['texts'].append(text)
+
+        profile = self._speaker_profiles[speaker_id]
+        profile['texts'].append(text)
+        if not count_for_role:
+            profile['needs_review_segments'] += 1
+            return
+
         role, confidence = self._classify_role_by_keywords(text)
-        self._speaker_profiles[speaker_id]['role_votes'][role] += confidence
+        if role != 'unknown':
+            profile['role_votes'][role] += confidence
 
     def _get_speaker_role(self, speaker_id: str) -> Tuple[str, float]:
         if speaker_id not in self._speaker_profiles:
             return 'unknown', 0.5
-        
+
         votes = self._speaker_profiles[speaker_id]['role_votes']
-        total_votes = sum(votes.values())
-        
-        if total_votes == 0:
+        engineer_score = votes['engineer']
+        climatologist_score = votes['climatologist']
+
+        if abs(engineer_score - climatologist_score) < 1e-9:
             return 'unknown', 0.5
-        
-        best_role = max(votes, key=votes.get)
-        confidence = votes[best_role] / total_votes
-        
-        return best_role, confidence
+
+        total = engineer_score + climatologist_score
+        if engineer_score > climatologist_score:
+            return 'engineer', engineer_score / total
+        return 'climatologist', climatologist_score / total
 
     def _simulate_diarization(self, audio_path: str, 
                               segments_info: List[Dict[str, Any]] = None) -> List[SpeakerSegment]:
@@ -190,46 +226,71 @@ class PyannoteSpeakerDiarizer:
                                        speaker_segments: List[SpeakerSegment],
                                        transcript_segments: List[Dict[str, Any]]) -> List[SpeakerSegment]:
         aligned_segments = []
-        
+
         for transcript_seg in transcript_segments:
             trans_start = transcript_seg.get('start', 0)
             trans_end = transcript_seg.get('end', 0)
             trans_text = transcript_seg.get('text', '')
-            
+            trans_duration = trans_end - trans_start
+
             best_speaker = None
             max_overlap = 0
-            
+
             for speaker_seg in speaker_segments:
                 overlap_start = max(trans_start, speaker_seg.start_time)
                 overlap_end = min(trans_end, speaker_seg.end_time)
                 overlap_duration = max(0, overlap_end - overlap_start)
-                
+
                 if overlap_duration > max_overlap:
                     max_overlap = overlap_duration
                     best_speaker = speaker_seg
-            
-            if best_speaker:
-                self._update_speaker_profile(best_speaker.speaker_id, trans_text)
-                role, role_confidence = self._get_speaker_role(best_speaker.speaker_id)
-                
-                aligned_segments.append(SpeakerSegment(
-                    speaker_id=best_speaker.speaker_id,
-                    speaker_role=role,
-                    start_time=trans_start,
-                    end_time=trans_end,
-                    confidence=best_speaker.confidence * (0.6 + 0.4 * role_confidence),
-                    text=trans_text
-                ))
-            else:
+
+            if best_speaker is None:
                 aligned_segments.append(SpeakerSegment(
                     speaker_id='UNKNOWN',
                     speaker_role='unknown',
                     start_time=trans_start,
                     end_time=trans_end,
                     confidence=0.5,
-                    text=trans_text
+                    text=trans_text,
+                    needs_review=True
                 ))
-        
+                continue
+
+            if trans_duration > 0:
+                alignment_confidence = best_speaker.confidence * (max_overlap / trans_duration)
+            else:
+                alignment_confidence = 0.0
+            needs_review = alignment_confidence < self.review_threshold
+
+            self._update_speaker_profile(best_speaker.speaker_id, trans_text,
+                                         count_for_role=not needs_review)
+
+            aligned_segments.append(SpeakerSegment(
+                speaker_id=best_speaker.speaker_id,
+                speaker_role='unknown',
+                start_time=trans_start,
+                end_time=trans_end,
+                confidence=best_speaker.confidence,
+                text=trans_text,
+                needs_review=needs_review
+            ))
+
+        # 一次调用只给一个角色结论：对齐循环结束后，用本次调用累积的画像
+        # 就地把最终角色与段落置信度回填到已生成的段落上。
+        final_roles = {}
+        for seg in aligned_segments:
+            if seg.speaker_id != 'UNKNOWN' and seg.speaker_id not in final_roles:
+                final_roles[seg.speaker_id] = self._get_speaker_role(seg.speaker_id)
+
+        for seg in aligned_segments:
+            if seg.speaker_id == 'UNKNOWN':
+                continue
+            role, role_confidence = final_roles[seg.speaker_id]
+            base_confidence = seg.confidence
+            seg.speaker_role = role
+            seg.confidence = base_confidence * (0.6 + 0.4 * role_confidence)
+
         return aligned_segments
 
     def get_speaker_summary(self) -> Dict[str, Any]:
@@ -240,7 +301,8 @@ class PyannoteSpeakerDiarizer:
                 'role': role,
                 'confidence': confidence,
                 'total_segments': len(profile['texts']),
-                'total_words': sum(len(text.split()) for text in profile['texts'])
+                'total_words': sum(_count_words(text) for text in profile['texts']),
+                'needs_review_segments': profile['needs_review_segments']
             }
         return summary
 
@@ -248,8 +310,10 @@ class PyannoteSpeakerDiarizer:
         self._speaker_profiles = {}
 
 
-def create_diarizer(auth_token: str = None) -> PyannoteSpeakerDiarizer:
-    return PyannoteSpeakerDiarizer(auth_token=auth_token)
+def create_diarizer(auth_token: str = None,
+                    review_threshold: float = 0.6) -> PyannoteSpeakerDiarizer:
+    return PyannoteSpeakerDiarizer(auth_token=auth_token,
+                                   review_threshold=review_threshold)
 
 
 def diarize_and_label(audio_path: str, 
@@ -264,5 +328,6 @@ def diarize_and_label(audio_path: str,
         'start_time': seg.start_time,
         'end_time': seg.end_time,
         'confidence': seg.confidence,
-        'text': seg.text
+        'text': seg.text,
+        'needs_review': seg.needs_review
     } for seg in segments]
